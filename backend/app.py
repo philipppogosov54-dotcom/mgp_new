@@ -5,10 +5,19 @@ Flask + Server-Sent Events для streaming
 
 import asyncio
 import os
+import time
+import uuid
+import logging
 from datetime import datetime
-from flask import Flask, render_template, request, Response, jsonify, stream_with_context
+from flask import Flask, render_template, request, Response, jsonify, stream_with_context, g
 from flask_cors import CORS
-from yandex_handler import YandexGPTHandler
+from werkzeug.exceptions import HTTPException
+try:
+    # если запускают из папки backend (python app.py)
+    from yandex_handler import YandexGPTHandler
+except ImportError:
+    # если запускают из корня (python -m backend.app)
+    from backend.yandex_handler import YandexGPTHandler
 import json
 import queue
 import threading
@@ -17,22 +26,63 @@ app = Flask(__name__, template_folder='templates', static_folder='static')
 CORS(app)
 
 # === ЛОГИРОВАНИЕ ===
-import sys
-def log(msg, level="INFO"):
-    """Красивый лог с цветами"""
-    colors = {
-        "INFO": "\033[94m",    # синий
-        "OK": "\033[92m",      # зелёный
-        "WARN": "\033[93m",    # жёлтый
-        "ERROR": "\033[91m",   # красный
-        "MSG": "\033[95m",     # фиолетовый
-        "FUNC": "\033[96m",    # голубой
+def _setup_logging() -> logging.Logger:
+    """
+    Единая настройка логирования в консоль.
+    Управление:
+      - LOG_LEVEL=DEBUG|INFO|WARNING|ERROR (по умолчанию INFO)
+    """
+    logger = logging.getLogger("mgp_bot")
+
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logger.setLevel(level)
+
+    if logger.handlers:
+        handler = logger.handlers[0]
+    else:
+        handler = logging.StreamHandler()
+        logger.addHandler(handler)
+
+    handler.setLevel(level)
+    formatter = logging.Formatter(
+        fmt="%(asctime)s.%(msecs)03d %(levelname)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    handler.setFormatter(formatter)
+
+    # WerkZeug: по умолчанию скрываем access-логи (они дублируют наши -> / <-).
+    # При необходимости можно включить обратно через WERKZEUG_LOG_LEVEL=INFO.
+    werk_logger = logging.getLogger("werkzeug")
+    werk_level_name = os.getenv("WERKZEUG_LOG_LEVEL", "WARNING").upper()
+    werk_level = getattr(logging, werk_level_name, logging.WARNING)
+    werk_logger.setLevel(werk_level)
+    if not werk_logger.handlers:
+        werk_logger.addHandler(handler)
+    else:
+        # на случай, если handler уже был, приведём его к одному формату
+        for h in werk_logger.handlers:
+            h.setLevel(werk_level)
+            h.setFormatter(formatter)
+
+    return logger
+
+
+logger = _setup_logging()
+
+
+def log(msg: str, level: str = "INFO"):
+    """Совместимость со старым логгером (level=INFO/OK/WARN/ERROR/MSG/FUNC)."""
+    level_map = {
+        "INFO": logging.INFO,
+        "OK": logging.INFO,
+        "WARN": logging.WARNING,
+        "ERROR": logging.ERROR,
+        "MSG": logging.INFO,
+        "FUNC": logging.DEBUG,
     }
-    reset = "\033[0m"
-    time_str = datetime.now().strftime("%H:%M:%S")
-    color = colors.get(level, "")
-    print(f"{color}[{time_str}] [{level}] {msg}{reset}", flush=True)
-    sys.stdout.flush()
+    py_level = level_map.get(level, logging.INFO)
+    logger.log(py_level, f"[{level}] {msg}")
 
 # Глобальный handler (для простоты — один на всех, в production нужно по сессиям)
 handlers = {}
@@ -48,6 +98,43 @@ def get_handler(session_id: str) -> YandexGPTHandler:
 def index():
     """Главная страница с чатом"""
     return render_template('chat.html')
+
+@app.route('/favicon.ico')
+def favicon():
+    """Чтобы не засорять логи 404-ками от браузера."""
+    return ("", 204)
+
+@app.before_request
+def _log_request_start():
+    g._req_start = time.perf_counter()
+    g.request_id = uuid.uuid4().hex[:8]
+    logger.info("-> %s %s rid=%s ip=%s", request.method, request.path, g.request_id, request.remote_addr)
+
+
+@app.after_request
+def _log_request_end(response):
+    try:
+        duration_ms = int((time.perf_counter() - getattr(g, "_req_start", time.perf_counter())) * 1000)
+    except Exception:
+        duration_ms = -1
+    rid = getattr(g, "request_id", "-")
+    logger.info("<- %s %s %s %dms rid=%s", request.method, request.path, response.status_code, duration_ms, rid)
+    # удобно дергать request-id из фронта при разборе багов
+    response.headers["X-Request-Id"] = rid
+    return response
+
+
+@app.errorhandler(Exception)
+def _handle_unexpected_error(e: Exception):
+    # не ломаем штатные HTTP ошибки (404/405 и т.п.)
+    if isinstance(e, HTTPException):
+        return e
+
+    rid = getattr(g, "request_id", "-")
+    logger.exception("Unhandled exception rid=%s path=%s", rid, request.path)
+    if request.path.startswith("/api/"):
+        return jsonify({"error": str(e), "request_id": rid}), 500
+    return "Internal Server Error", 500
 
 
 @app.route('/api/chat', methods=['POST'])
@@ -71,6 +158,7 @@ def chat():
         
         return jsonify({'response': response})
     except Exception as e:
+        logger.exception("chat error session_id=%s", session_id)
         return jsonify({'error': str(e)}), 500
 
 
@@ -117,6 +205,7 @@ def chat_stream():
                 token_queue.put(('done', response))
             except Exception as e:
                 result['error'] = str(e)
+                logger.exception("stream chat error session_id=%s", session_id)
                 log(f"❌ ОШИБКА: {e}", "ERROR")
                 token_queue.put(('error', str(e)))
         
